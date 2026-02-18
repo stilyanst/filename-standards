@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+# rename_safe.sh
+#
+# Safely rename files (and optionally directories) to remove spaces by replacing them with underscores.
+# - Dry-run by default (use --apply to actually rename)
+# - Non-recursive by default (use --recursive)
+# - Does NOT rename directories by default (use --dirs)
+# - Lowercase off by default (use --lowercase)
+# - Writes BOTH a human-readable log and a machine-readable (NUL-delimited) log for undo tooling.
+#
+# Notes:
+# - Filenames cannot contain NUL bytes, so NUL-delimited logs are safe for any path names (even with newlines/quotes).
+# - This script does NOT assume anything about your folder structure (no default excludes).
+
+set -u
+set -o pipefail
+
+########################################
+# Defaults
+########################################
+APPLY=0
+RECURSIVE=0
+RENAME_DIRS=0
+LOWERCASE=0
+USE_GIT=0
+
+INCLUDES=()
+EXCLUDES=()
+
+ROOT="$(pwd -P)"
+TS="$(date +%Y%m%d_%H%M%S)"
+LOG_BASENAME="rename_${TS}"
+LOG_DIR="."
+
+HUMAN_LOG=""
+MACHINE_LOG=""
+
+########################################
+# Helpers
+########################################
+usage() {
+  cat <<'EOF'
+Usage: ./rename_safe.sh [options]
+
+Core options:
+  --apply            Actually perform renames (default is dry-run)
+  --recursive        Rename recursively (default: current directory only)
+  --dirs             Also rename directories (default: only non-directories)
+  --lowercase        Also convert names to lowercase (default off)
+
+Logging:
+  --log-dir DIR      Where to write logs (default: .)
+  --log-basename STR Log file base name (default: rename_YYYYMMDD_HHMMSS)
+
+Filtering (Bash glob patterns, matched against paths relative to the current directory):
+  --include GLOB     Only consider paths matching this glob (repeatable)
+  --exclude GLOB     Skip paths matching this glob (repeatable)
+
+Git integration (optional):
+  --git              Use 'git mv' when inside a git repo (falls back to mv if git mv fails)
+
+Examples:
+  ./rename_safe.sh
+  ./rename_safe.sh --apply
+  ./rename_safe.sh --recursive --apply
+  ./rename_safe.sh --recursive --dirs --apply
+  ./rename_safe.sh --recursive --lowercase --apply
+  ./rename_safe.sh --recursive --exclude 'node_modules/*' --exclude '.git/*'
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+# Return 0 if rel_path should be processed, 1 otherwise
+should_process_path() {
+  local rel="$1"
+
+  # Includes: if any include patterns exist, rel must match at least one
+  if [[ ${#INCLUDES[@]} -gt 0 ]]; then
+    local matched=1
+    local pat
+    for pat in "${INCLUDES[@]}"; do
+      if [[ "$rel" == $pat ]]; then
+        matched=0
+        break
+      fi
+    done
+    [[ $matched -eq 0 ]] || return 1
+  fi
+
+  # Excludes: if rel matches any exclude pattern, skip
+  if [[ ${#EXCLUDES[@]} -gt 0 ]]; then
+    local pat
+    for pat in "${EXCLUDES[@]}"; do
+      if [[ "$rel" == $pat ]]; then
+        return 1
+      fi
+    done
+  fi
+
+  return 0
+}
+
+# Transform a single basename:
+# - spaces -> underscores
+# - collapse multiple underscores
+# - optionally lowercase
+transform_basename() {
+  local base="$1"
+  local out="${base// /_}"
+
+  # collapse multiple underscores
+  while [[ "$out" == *"__"* ]]; do
+    out="${out//__/_}"
+  done
+
+  if [[ $LOWERCASE -eq 1 ]]; then
+    out="${out,,}"
+  fi
+
+  printf '%s' "$out"
+}
+
+# Count path depth by number of '/' in a relative path
+path_depth() {
+  local rel="$1"
+  local slashes="${rel//[^\/]/}"
+  printf '%s' "${#slashes}"
+}
+
+# Make a temporary name in the same directory, guaranteed not to exist and not to clash with reserved paths
+# Args: old_rel
+make_temp_rel() {
+  local old_rel="$1"
+  local old_dir old_base temp_base temp_rel
+
+  if [[ "$old_rel" == */* ]]; then
+    old_dir="${old_rel%/*}"
+    old_base="${old_rel##*/}"
+  else
+    old_dir="."
+    old_base="$old_rel"
+  fi
+
+  while :; do
+    temp_base="${old_base}.__renamesafe_tmp__${RANDOM}${RANDOM}"
+    if [[ "$old_dir" == "." ]]; then
+      temp_rel="$temp_base"
+    else
+      temp_rel="$old_dir/$temp_base"
+    fi
+
+    # Not on filesystem AND not reserved in plan
+    if [[ ! -e "$ROOT/$temp_rel" && -z "${RESERVED_PATHS[$temp_rel]+x}" ]]; then
+      RESERVED_PATHS["$temp_rel"]=1
+      printf '%s' "$temp_rel"
+      return 0
+    fi
+  done
+}
+
+# Move one path (relative to ROOT) to another
+# Records status to logs.
+do_move() {
+  local from_rel="$1"
+  local to_rel="$2"
+
+  local from_abs="$ROOT/$from_rel"
+  local to_abs="$ROOT/$to_rel"
+
+  # If source missing, fail (do not stop entire script)
+  if [[ ! -e "$from_abs" && ! -L "$from_abs" ]]; then
+    echo "FAIL  '$from_rel' -> '$to_rel' (source missing)" | tee -a "$HUMAN_LOG"
+    printf '%s\0%s\0%s\0' "$from_rel" "$to_rel" "FAIL_SOURCE_MISSING" >> "$MACHINE_LOG"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    return 0
+  fi
+
+  # If target exists, skip (safe default)
+  if [[ -e "$to_abs" || -L "$to_abs" ]]; then
+    echo "SKIP  '$from_rel' -> '$to_rel' (target exists)" | tee -a "$HUMAN_LOG"
+    printf '%s\0%s\0%s\0' "$from_rel" "$to_rel" "SKIP_TARGET_EXISTS" >> "$MACHINE_LOG"
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    return 0
+  fi
+
+  if [[ $APPLY -eq 0 ]]; then
+    echo "PLAN  '$from_rel' -> '$to_rel'" | tee -a "$HUMAN_LOG"
+    printf '%s\0%s\0%s\0' "$from_rel" "$to_rel" "PLAN" >> "$MACHINE_LOG"
+    PLAN_COUNT=$((PLAN_COUNT + 1))
+    return 0
+  fi
+
+  # APPLY mode
+  if [[ $USE_GIT -eq 1 ]]; then
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      if git mv -- "$from_rel" "$to_rel" >/dev/null 2>&1; then
+        echo "OK    '$from_rel' -> '$to_rel' (git mv)" | tee -a "$HUMAN_LOG"
+        printf '%s\0%s\0%s\0' "$from_rel" "$to_rel" "OK_GIT" >> "$MACHINE_LOG"
+        OK_COUNT=$((OK_COUNT + 1))
+        return 0
+      fi
+      # fallback to mv if git mv fails (e.g., untracked file)
+    fi
+  fi
+
+  if mv -- "$from_abs" "$to_abs"; then
+    echo "OK    '$from_rel' -> '$to_rel'" | tee -a "$HUMAN_LOG"
+    printf '%s\0%s\0%s\0' "$from_rel" "$to_rel" "OK" >> "$MACHINE_LOG"
+    OK_COUNT=$((OK_COUNT + 1))
+  else
+    echo "FAIL  '$from_rel' -> '$to_rel' (mv failed)" | tee -a "$HUMAN_LOG"
+    printf '%s\0%s\0%s\0' "$from_rel" "$to_rel" "FAIL_MV" >> "$MACHINE_LOG"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+  fi
+
+  return 0
+}
+
+########################################
+# Parse args
+########################################
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --recursive) RECURSIVE=1 ;;
+    --dirs) RENAME_DIRS=1 ;;
+    --lowercase) LOWERCASE=1 ;;
+    --git) USE_GIT=1 ;;
+
+    --include)
+      [[ $# -ge 2 ]] || die "--include requires a glob pattern"
+      INCLUDES+=("$2")
+      shift
+      ;;
+
+    --exclude)
+      [[ $# -ge 2 ]] || die "--exclude requires a glob pattern"
+      EXCLUDES+=("$2")
+      shift
+      ;;
+
+    --log-dir)
+      [[ $# -ge 2 ]] || die "--log-dir requires a directory"
+      LOG_DIR="$2"
+      shift
+      ;;
+
+    --log-basename)
+      [[ $# -ge 2 ]] || die "--log-basename requires a string"
+      LOG_BASENAME="$2"
+      shift
+      ;;
+
+    -h|--help)
+      usage
+      exit 0
+      ;;
+
+    *)
+      die "Unknown option: $1 (use --help)"
+      ;;
+  esac
+  shift
+done
+
+[[ -d "$LOG_DIR" ]] || die "Log directory does not exist: $LOG_DIR"
+
+HUMAN_LOG="$LOG_DIR/${LOG_BASENAME}.log"
+MACHINE_LOG="$LOG_DIR/${LOG_BASENAME}.bin"
+
+########################################
+# Preflight
+########################################
+if [[ $USE_GIT -eq 1 ]]; then
+  command -v git >/dev/null 2>&1 || die "--git specified but git not found"
+fi
+
+# Make sure we operate from ROOT consistently (undo friendliness)
+cd "$ROOT" || die "Failed to cd to ROOT: $ROOT"
+
+# Initialize logs
+: > "$HUMAN_LOG"
+: > "$MACHINE_LOG"
+
+{
+  echo "# rename_safe.sh"
+  echo "# root: $ROOT"
+  echo "# mode: $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)"
+  echo "# recursive: $RECURSIVE"
+  echo "# rename_dirs: $RENAME_DIRS"
+  echo "# lowercase: $LOWERCASE"
+  echo "# use_git: $USE_GIT"
+  if [[ ${#INCLUDES[@]} -gt 0 ]]; then
+    printf '# includes:'
+    printf ' %q' "${INCLUDES[@]}"
+    echo
+  fi
+  if [[ ${#EXCLUDES[@]} -gt 0 ]]; then
+    printf '# excludes:'
+    printf ' %q' "${EXCLUDES[@]}"
+    echo
+  fi
+  echo
+} >> "$HUMAN_LOG"
+
+# Machine log header: "ROOT\0<root>\0"
+printf 'ROOT\0%s\0' "$ROOT" >> "$MACHINE_LOG"
+
+########################################
+# Build plan
+########################################
+declare -a PLAN_OLD_REL=()
+declare -a PLAN_NEW_REL=()
+declare -a PLAN_DEPTH=()
+declare -a PLAN_IS_DIR=()
+
+declare -A TARGET_SEEN=()
+declare -A TARGET_CASEFOLD_SEEN=()
+declare -A RESERVED_PATHS=()  # used for generating temp names too
+declare -A COLLISION_TARGETS=()
+declare -A CASEFOLD_COLLISIONS=()
+
+MAX_DEPTH=0
+
+# Find command (NUL-safe)
+if [[ $RECURSIVE -eq 1 ]]; then
+  FIND_CMD=(find . -mindepth 1 -print0)
+else
+  FIND_CMD=(find . -maxdepth 1 -mindepth 1 -print0)
+fi
+
+while IFS= read -r -d '' path; do
+  # Normalize to rel path without leading "./"
+  rel="${path#./}"
+
+  # Filtering
+  if ! should_process_path "$rel"; then
+    continue
+  fi
+
+  # Determine if it's a real directory (do not treat symlink-to-dir as a dir)
+  is_dir=0
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    is_dir=1
+  fi
+
+  # Skip directories unless requested
+  if [[ $is_dir -eq 1 && $RENAME_DIRS -eq 0 ]]; then
+    continue
+  fi
+
+  # Basename transform
+  base="${rel##*/}"
+  new_base="$(transform_basename "$base")"
+
+  # If nothing changes, skip
+  if [[ "$new_base" == "$base" ]]; then
+    continue
+  fi
+
+  # Build new rel path (same parent dir, new basename)
+  if [[ "$rel" == */* ]]; then
+    parent="${rel%/*}"
+    new_rel="$parent/$new_base"
+  else
+    new_rel="$new_base"
+  fi
+
+  # Reserve original and target paths for temp-name generation + validation
+  RESERVED_PATHS["$rel"]=1
+  RESERVED_PATHS["$new_rel"]=1
+
+  # Collision detection among targets
+  if [[ -n "${TARGET_SEEN[$new_rel]+x}" ]]; then
+    COLLISION_TARGETS["$new_rel"]=1
+  else
+    TARGET_SEEN["$new_rel"]="$rel"
+  fi
+
+  # Casefold collision detection among targets (helps avoid trouble on case-insensitive filesystems)
+  casefold="${new_rel,,}"
+  if [[ -n "${TARGET_CASEFOLD_SEEN[$casefold]+x}" ]]; then
+    CASEFOLD_COLLISIONS["$casefold"]=1
+  else
+    TARGET_CASEFOLD_SEEN["$casefold"]="$new_rel"
+  fi
+
+  depth="$(path_depth "$rel")"
+  (( depth > MAX_DEPTH )) && MAX_DEPTH="$depth"
+
+  PLAN_OLD_REL+=("$rel")
+  PLAN_NEW_REL+=("$new_rel")
+  PLAN_DEPTH+=("$depth")
+  PLAN_IS_DIR+=("$is_dir")
+done < <("${FIND_CMD[@]}")
+
+PLAN_COUNT_TOTAL="${#PLAN_OLD_REL[@]}"
+
+if [[ $PLAN_COUNT_TOTAL -eq 0 ]]; then
+  echo "No renames needed."
+  echo "Log written: $HUMAN_LOG"
+  echo "Machine log written: $MACHINE_LOG"
+  exit 0
+fi
+
+# Abort on collisions (safest default)
+if [[ ${#COLLISION_TARGETS[@]} -gt 0 ]]; then
+  {
+    echo "ERROR: Target collisions detected (multiple sources would rename to the same target)."
+    echo "Refuse to proceed for safety. Colliding targets:"
+    for k in "${!COLLISION_TARGETS[@]}"; do
+      echo "  - $k"
+    done
+  } | tee -a "$HUMAN_LOG" >&2
+  exit 1
+fi
+
+if [[ ${#CASEFOLD_COLLISIONS[@]} -gt 0 ]]; then
+  {
+    echo "ERROR: Case-insensitive target collisions detected."
+    echo "This can break on case-insensitive filesystems or tools; refusing to proceed."
+    echo "Colliding casefold keys:"
+    for k in "${!CASEFOLD_COLLISIONS[@]}"; do
+      echo "  - $k"
+    done
+  } | tee -a "$HUMAN_LOG" >&2
+  exit 1
+fi
+
+########################################
+# Apply renames in safest order:
+# - deepest paths first (so children before parent directories)
+# - inside each depth group, resolve any dependency cycles with temp names
+########################################
+OK_COUNT=0
+SKIP_COUNT=0
+FAIL_COUNT=0
+PLAN_COUNT=0
+
+# Build indices per depth
+declare -a DEPTH_BUCKETS=()
+for ((d=0; d<=MAX_DEPTH; d++)); do
+  DEPTH_BUCKETS[$d]=""
+done
+
+for ((i=0; i<PLAN_COUNT_TOTAL; i++)); do
+  d="${PLAN_DEPTH[$i]}"
+  DEPTH_BUCKETS[$d]="${DEPTH_BUCKETS[$d]} $i"
+done
+
+# For each depth from deepest to shallowest
+for ((d=MAX_DEPTH; d>=0; d--)); do
+  bucket="${DEPTH_BUCKETS[$d]}"
+  # trim
+  bucket="${bucket#"${bucket%%[![:space:]]*}"}"
+  [[ -z "$bucket" ]] && continue
+
+  # Collect indices in this bucket
+  indices=()
+  for idx in $bucket; do
+    indices+=("$idx")
+  done
+
+  # Local graph for dependency ordering inside this depth group:
+  # A rename i depends on j if its target equals j's source.
+  declare -A LOCAL_OLD_TO_POS=()
+  m="${#indices[@]}"
+
+  # Local arrays for current source/target (may be updated if we break cycles with temp moves)
+  declare -a G_FROM=()
+  declare -a G_TO=()
+  declare -a G_POS_TO_GLOBAL=()
+
+  for ((p=0; p<m; p++)); do
+    gi="${indices[$p]}"
+    from="${PLAN_OLD_REL[$gi]}"
+    to="${PLAN_NEW_REL[$gi]}"
+    G_FROM[$p]="$from"
+    G_TO[$p]="$to"
+    G_POS_TO_GLOBAL[$p]="$gi"
+    LOCAL_OLD_TO_POS["$from"]="$p"
+  done
+
+  # Build indegree (0/1) + dependents list
+  declare -a INDEG=()
+  declare -A DEPENDENTS=()
+  declare -a PROCESSED=()
+  for ((p=0; p<m; p++)); do
+    INDEG[$p]=0
+    PROCESSED[$p]=0
+  done
+
+  for ((p=0; p<m; p++)); do
+    dep_pos=""
+    if [[ -n "${LOCAL_OLD_TO_POS[${G_TO[$p]}]+x}" ]]; then
+      dep_pos="${LOCAL_OLD_TO_POS[${G_TO[$p]}]}"
+      INDEG[$p]=1
+      DEPENDENTS[$dep_pos]="${DEPENDENTS[$dep_pos]-} $p"
+    fi
+  done
+
+  # Queue of nodes with indegree 0
+  queue=()
+  for ((p=0; p<m; p++)); do
+    if [[ "${INDEG[$p]}" -eq 0 ]]; then
+      queue+=("$p")
+    fi
+  done
+
+  # Process with cycle breaking if needed
+  processed_count=0
+  while :; do
+    while [[ ${#queue[@]} -gt 0 ]]; do
+      p="${queue[0]}"
+      queue=("${queue[@]:1}")
+
+      [[ "${PROCESSED[$p]}" -eq 1 ]] && continue
+      PROCESSED[$p]=1
+      processed_count=$((processed_count + 1))
+
+      do_move "${G_FROM[$p]}" "${G_TO[$p]}"
+
+      # Reduce indegree of dependents
+      kids="${DEPENDENTS[$p]-}"
+      for child in $kids; do
+        if [[ "${PROCESSED[$child]}" -eq 0 ]]; then
+          INDEG[$child]=0
+          queue+=("$child")
+        fi
+      done
+    done
+
+    # If all processed, done with this depth group
+    if [[ $processed_count -ge $m ]]; then
+      break
+    fi
+
+    # Cycle exists among unprocessed nodes. Break it safely:
+    # Pick an unprocessed node p0 and move its current source to a unique temp name,
+    # freeing its old path for others.
+    p0=-1
+    for ((p=0; p<m; p++)); do
+      if [[ "${PROCESSED[$p]}" -eq 0 ]]; then
+        p0="$p"
+        break
+      fi
+    done
+    [[ $p0 -ge 0 ]] || break
+
+    old0="${G_FROM[$p0]}"
+    tmp0="$(make_temp_rel "$old0")"
+
+    # Move old0 -> tmp0 (this is an actual filesystem move step)
+    do_move "$old0" "$tmp0"
+
+    # Update mapping so this node now represents tmp0 -> original target
+    unset 'LOCAL_OLD_TO_POS[$old0]'
+    G_FROM[$p0]="$tmp0"
+    LOCAL_OLD_TO_POS["$tmp0"]="$p0"
+
+    # Any node that depended on p0 because it wanted to move into old0 can now proceed.
+    kids="${DEPENDENTS[$p0]-}"
+    for child in $kids; do
+      if [[ "${PROCESSED[$child]}" -eq 0 ]]; then
+        INDEG[$child]=0
+        queue+=("$child")
+      fi
+    done
+
+    # Clear dependents list for p0 (old0 is freed); keep p0's own dependency unchanged.
+    DEPENDENTS[$p0]=""
+  done
+
+  # Cleanup locals for next bucket (avoid leaking)
+  unset LOCAL_OLD_TO_POS INDEG DEPENDENTS PROCESSED queue indices G_FROM G_TO G_POS_TO_GLOBAL
+done
+
+########################################
+# Summary
+########################################
+{
+  echo
+  echo "=== Summary ==="
+  echo "Root: $ROOT"
+  echo "Mode: $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)"
+  echo "Planned candidates: $PLAN_COUNT_TOTAL"
+  echo "Executed OK:  $OK_COUNT"
+  echo "Skipped:      $SKIP_COUNT"
+  echo "Failed:       $FAIL_COUNT"
+  echo "Plan-only:    $PLAN_COUNT"
+  echo
+  echo "Human log:   $HUMAN_LOG"
+  echo "Machine log: $MACHINE_LOG"
+} | tee -a "$HUMAN_LOG"
+
+exit 0

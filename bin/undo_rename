@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# undo_rename.sh
+#
+# Undo renames performed by rename_safe.sh using its machine log (.bin).
+#
+# Machine log format (NUL-delimited):
+#   ROOT\0<absolute-root>\0
+#   <old_rel>\0<new_rel>\0<status>\0  (repeated)
+#
+# We undo ONLY records with status OK or OK_GIT, and we undo in reverse order:
+#   mv <new_rel> -> <old_rel>
+#
+# Safe defaults:
+#   - dry-run by default (use --apply)
+#   - will not overwrite: skips if <old_rel> already exists
+#   - skips if <new_rel> missing
+
+set -euo pipefail
+
+APPLY=0
+USE_GIT=0
+LOGFILE=""
+
+usage() {
+  cat <<'EOF'
+Usage: ./undo_rename.sh [--apply] [--git] <rename_*.bin>
+
+Options:
+  --apply   Actually perform undo (default: dry-run)
+  --git     Prefer 'git mv' when inside a git repo (falls back to mv)
+
+Examples:
+  ./undo_rename.sh rename_20260218_211939.bin
+  ./undo_rename.sh --apply rename_20260218_211939.bin
+  ./undo_rename.sh --apply --git rename_20260218_211939.bin
+EOF
+}
+
+die() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+# Make a path absolute in a portable-ish way
+abspath() {
+  local p="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -- "$p"
+  else
+    # Fallback: dirname + pwd -P + basename
+    local d b
+    d="$(dirname -- "$p")"
+    b="$(basename -- "$p")"
+    (cd "$d" && printf '%s/%s\n' "$(pwd -P)" "$b")
+  fi
+}
+
+########################################
+# Parse args
+########################################
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --git) USE_GIT=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *)
+      if [[ -z "$LOGFILE" ]]; then
+        LOGFILE="$1"
+      else
+        die "Unexpected extra argument: $1"
+      fi
+      ;;
+  esac
+  shift
+done
+
+[[ -n "$LOGFILE" ]] || { usage; exit 1; }
+[[ -f "$LOGFILE" ]] || die "Log file not found: $LOGFILE"
+
+LOGFILE="$(abspath "$LOGFILE")"
+
+########################################
+# Read machine log (NUL-delimited)
+########################################
+# Open log on FD 3 for NUL-safe reads
+exec 3< "$LOGFILE"
+
+# Read header: ROOT\0<root>\0
+IFS= read -r -d '' tag <&3 || die "Invalid log: missing ROOT header"
+[[ "$tag" == "ROOT" ]] || die "Invalid log: expected 'ROOT' header, got '$tag'"
+
+IFS= read -r -d '' ROOT <&3 || die "Invalid log: missing root path after ROOT header"
+[[ -d "$ROOT" ]] || die "Root directory from log does not exist: $ROOT"
+
+# Read records: old_rel\0new_rel\0status\0
+# We store ONLY successful renames for undo, but in arrays so we can reverse later.
+declare -a UNDO_FROM=()   # new_rel (current)
+declare -a UNDO_TO=()     # old_rel (target restore)
+declare -a UNDO_STATUS=()
+
+while IFS= read -r -d '' old_rel <&3; do
+  # Need two more fields to complete the triple
+  IFS= read -r -d '' new_rel <&3 || die "Corrupt log: incomplete record (missing new_rel)"
+  IFS= read -r -d '' status  <&3 || die "Corrupt log: incomplete record (missing status)"
+
+  # Only undo actual successful renames
+  if [[ "$status" == "OK" || "$status" == "OK_GIT" ]]; then
+    UNDO_FROM+=("$new_rel")
+    UNDO_TO+=("$old_rel")
+    UNDO_STATUS+=("$status")
+  fi
+done
+
+# Close FD 3
+exec 3<&-
+
+COUNT="${#UNDO_FROM[@]}"
+if [[ "$COUNT" -eq 0 ]]; then
+  echo "Nothing to undo (no OK/OK_GIT records found)."
+  echo "Log: $LOGFILE"
+  exit 0
+fi
+
+########################################
+# Prepare undo run
+########################################
+TS="$(date +%Y%m%d_%H%M%S)"
+UNDO_LOG="undo_${TS}.log"
+
+echo "# undo_rename.sh" | tee "$UNDO_LOG"
+echo "# log:  $LOGFILE" | tee -a "$UNDO_LOG"
+echo "# root: $ROOT" | tee -a "$UNDO_LOG"
+echo "# mode: $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)" | tee -a "$UNDO_LOG"
+echo "# use_git: $USE_GIT" | tee -a "$UNDO_LOG"
+echo "# records_to_undo: $COUNT" | tee -a "$UNDO_LOG"
+echo | tee -a "$UNDO_LOG"
+
+cd "$ROOT" || die "Failed to cd into root: $ROOT"
+
+OK=0
+SKIP=0
+FAIL=0
+PLAN=0
+
+do_undo_move() {
+  local from_rel="$1"  # existing (new name)
+  local to_rel="$2"    # restore (old name)
+
+  # If source missing, skip
+  if [[ ! -e "$from_rel" && ! -L "$from_rel" ]]; then
+    echo "SKIP  '$from_rel' -> '$to_rel' (source missing)" | tee -a "$UNDO_LOG"
+    SKIP=$((SKIP + 1))
+    return 0
+  fi
+
+  # If destination exists, skip (don’t overwrite)
+  if [[ -e "$to_rel" || -L "$to_rel" ]]; then
+    echo "SKIP  '$from_rel' -> '$to_rel' (target exists)" | tee -a "$UNDO_LOG"
+    SKIP=$((SKIP + 1))
+    return 0
+  fi
+
+  if [[ $APPLY -eq 0 ]]; then
+    echo "PLAN  '$from_rel' -> '$to_rel'" | tee -a "$UNDO_LOG"
+    PLAN=$((PLAN + 1))
+    return 0
+  fi
+
+  # APPLY mode
+  if [[ $USE_GIT -eq 1 ]] && command -v git >/dev/null 2>&1; then
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      if git mv -- "$from_rel" "$to_rel" >/dev/null 2>&1; then
+        echo "OK    '$from_rel' -> '$to_rel' (git mv)" | tee -a "$UNDO_LOG"
+        OK=$((OK + 1))
+        return 0
+      fi
+      # fallback to mv
+    fi
+  fi
+
+  if mv -- "$from_rel" "$to_rel"; then
+    echo "OK    '$from_rel' -> '$to_rel'" | tee -a "$UNDO_LOG"
+    OK=$((OK + 1))
+  else
+    echo "FAIL  '$from_rel' -> '$to_rel' (mv failed)" | tee -a "$UNDO_LOG"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+########################################
+# Undo in reverse order
+########################################
+for ((i=COUNT-1; i>=0; i--)); do
+  do_undo_move "${UNDO_FROM[$i]}" "${UNDO_TO[$i]}"
+done
+
+echo | tee -a "$UNDO_LOG"
+echo "=== Summary ===" | tee -a "$UNDO_LOG"
+echo "Root: $ROOT" | tee -a "$UNDO_LOG"
+echo "Mode: $([[ $APPLY -eq 1 ]] && echo APPLY || echo DRY-RUN)" | tee -a "$UNDO_LOG"
+echo "Records in log: $COUNT (OK/OK_GIT only)" | tee -a "$UNDO_LOG"
+echo "Undone OK: $OK" | tee -a "$UNDO_LOG"
+echo "Planned:   $PLAN" | tee -a "$UNDO_LOG"
+echo "Skipped:   $SKIP" | tee -a "$UNDO_LOG"
+echo "Failed:    $FAIL" | tee -a "$UNDO_LOG"
+echo "Undo log:  $UNDO_LOG"
