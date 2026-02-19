@@ -1,4 +1,4 @@
-# rename-tools
+# filename-standards
 
 Two Bash scripts:
 
